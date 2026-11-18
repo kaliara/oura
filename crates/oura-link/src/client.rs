@@ -1,4 +1,4 @@
-//! [`OuraClient`] — the high-level, transport-generic API.
+//! [`OuraClient`] - the high-level, transport-generic API.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +17,7 @@ pub const DEFAULT_QUIET: Duration = Duration::from_millis(1500);
 /// Shows each packet's tag, ext-tag and raw payload hex (payloads never carry the key).
 fn dump_packets(packets: &[Packet]) -> String {
     if packets.is_empty() {
-        return "<no packets — ring sent nothing before the quiet window>".to_string();
+        return "<no packets - ring sent nothing before the quiet window>".to_string();
     }
     packets
         .iter()
@@ -88,14 +88,14 @@ pub struct BatchProgress {
 }
 
 /// Quiet-window fallback for event-batch requests. Batches terminate on the
-/// ring's summary packet, so this only fires when the link died — but a ring can
+/// ring's summary packet, so this only fires when the link died - but a ring can
 /// legitimately pause mid-batch (bundling/flash reads), so it is deliberately
 /// more patient than the per-command window to avoid false "link lost" errors.
 const DRAIN_QUIET: Duration = Duration::from_secs(6);
 
 /// Events requested per extended-drain batch. The official app asks for 65535
 /// (everything) in one batch, but the cursor can only be checkpointed at batch
-/// boundaries — one giant batch means a dropped link forfeits ALL progress and
+/// boundaries - one giant batch means a dropped link forfeits ALL progress and
 /// gives no progress reporting. A few thousand events (~1 min of transfer) keeps
 /// the per-batch round-trip overhead negligible while bounding what a drop can
 /// lose and yielding regular `bytes_left` progress updates.
@@ -203,7 +203,7 @@ impl<T: Transport> OuraClient<T> {
         bytes: &[u8],
         terminal: impl Fn(&Packet) -> bool,
     ) -> Result<Vec<Packet>> {
-        // 4× the configured window, capped at DRAIN_QUIET — so tests with a tiny
+        // 4× the configured window, capped at DRAIN_QUIET - so tests with a tiny
         // quiet stay fast while the default gets the patient 6 s fallback.
         let quiet = (self.quiet * 4).min(DRAIN_QUIET).max(self.quiet);
         tracing::debug!(tx = %hex::encode(bytes), tx_len = bytes.len(), "→ batch request");
@@ -281,12 +281,12 @@ impl<T: Transport> OuraClient<T> {
     /// Run the app-auth challenge with a 16-byte key. Must be repeated per
     /// connection on rings that have a key installed.
     pub async fn authenticate(&self, key: &[u8; 16]) -> Result<AuthResult> {
-        // Never log key bytes (not even a slice — that leaks key material). Only the
+        // Never log key bytes (not even a slice - that leaks key material). Only the
         // length; "is it the right key" is answered by the Swift-side hashed fingerprint
         // and whether auth ultimately succeeds.
         tracing::debug!(
             key_len = key.len(),
-            "auth: step 1 — requesting nonce (0x2b → expect 0x2c)"
+            "auth: step 1 - requesting nonce (0x2b → expect 0x2c)"
         );
         let packets = self.request_ext(&protocol::req_auth_nonce(), 0x2c).await?;
         let nonce = match packets.iter().find(|p| p.ext_tag() == Some(0x2c)) {
@@ -299,12 +299,12 @@ impl<T: Transport> OuraClient<T> {
                 )));
             }
         };
-        tracing::debug!(nonce = %hex::encode(&nonce), nonce_len = nonce.len(), "auth: step 2 — got nonce");
+        tracing::debug!(nonce = %hex::encode(&nonce), nonce_len = nonce.len(), "auth: step 2 - got nonce");
 
         // The encrypted block is deterministic from key+nonce via the shared Rust AES,
         // so it can't differ between clients and isn't logged (it's key-derived material).
         let encrypted = encrypt_nonce(key, &nonce);
-        tracing::debug!("auth: step 3 — sending AES-128/ECB/PKCS7(nonce) (0x2d → expect 0x2e)");
+        tracing::debug!("auth: step 3 - sending AES-128/ECB/PKCS7(nonce) (0x2d → expect 0x2e)");
         let packets = self
             .request_ext(&protocol::req_authenticate(&encrypted), 0x2e)
             .await?;
@@ -327,7 +327,7 @@ impl<T: Transport> OuraClient<T> {
         };
 
         let result = AuthResult::from(state);
-        tracing::debug!(state = %format!("0x{state:02x}"), ?result, "auth: step 4 — ring verdict");
+        tracing::debug!(state = %format!("0x{state:02x}"), ?result, "auth: step 4 - ring verdict");
         if result.is_success() {
             Ok(result)
         } else {
@@ -335,19 +335,19 @@ impl<T: Transport> OuraClient<T> {
             // bytes exchanged (never the key), so a report pins down key-vs-transport.
             let hint = match result {
                 AuthResult::AuthenticationError => {
-                    "the ring rejected the key — it does not match THIS ring's installed key \
+                    "the ring rejected the key - it does not match THIS ring's installed key \
                      (re-export the key from the phone that onboarded this exact ring)"
                 }
                 AuthResult::InFactoryReset => {
-                    "the ring is factory-reset (no key installed yet) — pair/onboard it first"
+                    "the ring is factory-reset (no key installed yet) - pair/onboard it first"
                 }
                 AuthResult::NotOriginalOnboardedDevice => {
-                    "the ring is bonded to a different onboarding — its key is not the one in use"
+                    "the ring is bonded to a different onboarding - its key is not the one in use"
                 }
                 _ => "unexpected auth state",
             };
             Err(Error::Auth(format!(
-                "ring rejected auth: state=0x{state:02x} ({result:?}) — {hint}. \
+                "ring rejected auth: state=0x{state:02x} ({result:?}) - {hint}. \
                  nonce={} ({}B)",
                 hex::encode(&nonce),
                 nonce.len()
@@ -365,18 +365,23 @@ impl<T: Transport> OuraClient<T> {
         }
     }
 
-    /// Align the ring clock to host UTC.
+    /// Align the ring clock to host UTC and the local UTC offset. The ring echoes
+    /// the offset into the `time_sync` anchor it writes, which is how stored history
+    /// gets its local time (`oura_protocol::ring_time`), so it must be the real one:
+    /// a zero here would be indistinguishable from a host actually in UTC.
     pub async fn sync_time(&self) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.request(&protocol::req_sync_time(now, 0)).await?;
+        let utc_offset_half_hours = local_utc_offset_half_hours() as u8;
+        self.request(&protocol::req_sync_time(now, utc_offset_half_hours))
+            .await?;
         Ok(())
     }
 
     /// Align the ring clock to exact unix seconds and the local UTC offset, as Oura
-    /// does. `sync_time` sends the same packet with a zero offset.
+    /// does. Same packet as `sync_time`, but waits for the `0x13` acknowledgement.
     pub async fn sync_time_app(&self) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -450,7 +455,7 @@ impl<T: Transport> OuraClient<T> {
     /// A batch that ends without the ring's summary packet is a hard error, not
     /// a completed sync: the summary is the ring's explicit terminator, so its
     /// absence means the link died mid-batch. Callers should reconnect and call
-    /// again — the persisted cursor makes that resume, not restart.
+    /// again - the persisted cursor makes that resume, not restart.
     pub async fn drain_events<F, G>(
         &self,
         cursor: u32,
@@ -469,7 +474,7 @@ impl<T: Transport> OuraClient<T> {
         // unsupported.
         let mut use_extended = true;
         // A batch is over when the ring's summary packet arrives (0x11 legacy /
-        // ext 0x42) — the same terminator the official app waits for. An ext
+        // ext 0x42) - the same terminator the official app waits for. An ext
         // status packet (payload[0]=0x00, "unsupported") also ends the request.
         let batch_terminal = |p: &Packet| {
             p.tag == 0x11 || (p.tag == 0x2f && matches!(p.payload.first(), Some(0x42) | Some(0x00)))
@@ -508,7 +513,7 @@ impl<T: Transport> OuraClient<T> {
 
             let batch = decode_batch(&packets).map_err(|e| {
                 Error::Protocol(format!(
-                    "{e} — BLE link lost mid-batch? cursor {start} is checkpointed; \
+                    "{e} - BLE link lost mid-batch? cursor {start} is checkpointed; \
                      reconnect and sync again to resume"
                 ))
             })?;
@@ -566,7 +571,7 @@ impl<T: Transport> OuraClient<T> {
             // Do not send the official app's GetEvent ack-fetch (max_events=0).
             // GetEvent is cursor-addressed: the next loop's DataFlush + GetEvent(start)
             // already continues from the checkpoint. On Horizon 3.4.3 (BLB_*) the
-            // ack-fetch is not a cheap 0x11 — the ring holds the next 255 events for
+            // ack-fetch is not a cheap 0x11 - the ring holds the next 255 events for
             // ~2 minutes, we discarded that stream, then fetched the same batch again
             // in ~1s. That turned a 0.7s link batch into a 2-minute "link" stall on
             // Windows (Maxime, 2026-09-18). Ring 5 has the same failure mode: the
@@ -577,7 +582,7 @@ impl<T: Transport> OuraClient<T> {
                 }
                 return Err(Error::Protocol(format!(
                     "ring reports {bytes_left} bytes of events left but the batch \
-                     contained none (rejected={}, replayed={}) — stopping instead \
+                     contained none (rejected={}, replayed={}) - stopping instead \
                      of looping (cursor {start})",
                     batch.rejected_events, batch.replayed_events
                 )));
@@ -744,7 +749,7 @@ impl<T: Transport> OuraClient<T> {
     }
 
     /// Configure/arm an RData session for one or more signal types. **This starts
-    /// persistent flash sampling that does NOT self-stop** — the caller is
+    /// persistent flash sampling that does NOT self-stop** - the caller is
     /// responsible for the `stop`+`clear` teardown. Returns `(subtag, status)`.
     pub async fn rdata_configure(
         &self,
@@ -987,7 +992,7 @@ mod tests {
     async fn legacy_drain_does_not_ack_fetch_after_a_batch() {
         // Horizon 3.4.3 rejects ExtGetEvent (0x2f/0x00 "unsupported") and falls
         // back to GetEvent. The next write after a successful batch must be the
-        // following DataFlush, not GetEvent(max_events=0) — that ack-fetch is
+        // following DataFlush, not GetEvent(max_events=0) - that ack-fetch is
         // what stalled Maxime's Windows sync for ~2 minutes per 255 events.
         let mock = MockTransport::new();
         mock.on("280100", &["290100"]);

@@ -12,12 +12,17 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::Result;
 use oura_protocol::device::{Battery, DeviceInfo};
 use oura_protocol::events::RingEvent;
+use oura_protocol::ring_time::{
+    ClockEvent, ClockSource, EpochSummary, RingClock, RTC_BEACON_TAG, TIME_SYNC_TAG,
+};
 
 /// Current historical-event decoder schema version stored in `store_meta`.
 ///
 /// Version 2 backfills historical `ring_start` (`0x41`) decodes while preserving
 /// synthetic phone `time_sync` (`0x42`) provenance and valid existing JSON.
-pub const DECODER_VERSION: i64 = 2;
+/// Version 3 adds `utc_offset_min` to `time_sync` and `rtc_beacon`, and replaces the
+/// beacon's misread `trailer` (offset byte + flags read as one u16) with `flags`.
+pub const DECODER_VERSION: i64 = 3;
 
 /// Default number of event rows processed per transaction during `redecode`.
 pub const REDECODE_BATCH_SIZE: usize = 1_000;
@@ -71,7 +76,52 @@ CREATE TABLE IF NOT EXISTS readings (
     captured_unix INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_readings_serial_kind ON readings(serial, kind);
+
+-- Derived wall-clock time per event (`oura_protocol::ring_time`), rebuilt from the
+-- raw events after every sync and by `oura clock`. `events` is never modified.
+CREATE TABLE IF NOT EXISTS event_time (
+    event_id       INTEGER PRIMARY KEY,
+    serial         TEXT NOT NULL,
+    unix_ms        INTEGER NOT NULL,
+    utc_offset_min INTEGER,
+    clock_source   TEXT NOT NULL,
+    undated_reason TEXT,
+    epoch          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_time_serial_unix ON event_time(serial, unix_ms);
+
+-- Events with their wall-clock time. Only `anchor` and `projected` rows are
+-- trustworthy to the minute; `local_time`/`local_date` are NULL when no anchor
+-- carried a UTC offset.
+CREATE VIEW IF NOT EXISTS events_timed AS
+SELECT e.id, e.serial, e.tag, e.name, e.ring_timestamp, e.decoded_json, e.captured_unix,
+       t.unix_ms, t.utc_offset_min, t.clock_source, t.undated_reason, t.epoch,
+       strftime('%Y-%m-%dT%H:%M:%fZ', t.unix_ms / 1000.0, 'unixepoch') AS utc_time,
+       CASE WHEN t.utc_offset_min IS NOT NULL THEN
+           strftime('%Y-%m-%dT%H:%M:%f', t.unix_ms / 1000.0 + t.utc_offset_min * 60, 'unixepoch')
+       END AS local_time,
+       CASE WHEN t.utc_offset_min IS NOT NULL THEN
+           date(t.unix_ms / 1000.0 + t.utc_offset_min * 60, 'unixepoch')
+       END AS local_date
+FROM events e LEFT JOIN event_time t ON t.event_id = e.id;
 "#;
+
+/// Result of rebuilding one device's `event_time` rows.
+#[derive(Clone, Debug)]
+pub struct ClockReport {
+    pub serial: String,
+    pub events: usize,
+    /// `(clock_source label, count)` in a fixed order: anchor, projected,
+    /// download_time, undated.
+    pub by_source: Vec<(&'static str, usize)>,
+    /// Earliest and latest trustworthy (`anchor`/`projected`) event times as
+    /// `(UTC unix seconds, UTC offset minutes in effect then)`.
+    pub first_dated: Option<(f64, Option<i32>)>,
+    pub last_dated: Option<(f64, Option<i32>)>,
+    /// Distinct UTC offsets assigned to dated events.
+    pub utc_offsets_min: Vec<i32>,
+    pub epochs: Vec<EpochSummary>,
+}
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -657,6 +707,110 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Recompute every device's `event_time` rows from the raw events. Each run
+    /// replaces the previous result: a later anchor can date or re-date earlier
+    /// events (an unanchored boot, a stall), so the mapping is never appended to.
+    pub fn rebuild_event_times(&self) -> Result<Vec<ClockReport>> {
+        self.device_serials()?
+            .iter()
+            .map(|serial| self.rebuild_event_times_for(serial))
+            .collect()
+    }
+
+    fn rebuild_event_times_for(&self, serial: &str) -> Result<ClockReport> {
+        // Capture order with the id tie-breaker (see `RingClock::from_events`). Only
+        // anchor bodies are needed; everything else contributes its counter value.
+        let rows: Vec<(i64, i64, u8, Vec<u8>, i64)> = {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id, ring_timestamp, tag,
+                        CASE WHEN tag IN ({TIME_SYNC_TAG}, {RTC_BEACON_TAG}) THEN body ELSE x'' END,
+                        captured_unix
+                 FROM events WHERE serial = ?1 ORDER BY captured_unix, id"
+            ))?;
+            let rows = stmt
+                .query_map(params![serial], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? as u8,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let clock = RingClock::from_events(rows.iter().map(|(_, ds, tag, body, captured)| {
+            ClockEvent {
+                ring_ds: *ds,
+                tag: *tag,
+                body,
+                captured_unix: *captured,
+            }
+        }));
+
+        let sources = [
+            ClockSource::Anchor,
+            ClockSource::Projected,
+            ClockSource::Fallback,
+            ClockSource::Undated,
+        ];
+        let mut counts = [0usize; 4];
+        let mut first: Option<(f64, Option<i32>)> = None;
+        let mut last: Option<(f64, Option<i32>)> = None;
+        let mut offsets = std::collections::BTreeSet::new();
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM event_time WHERE serial = ?1", params![serial])?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO event_time
+                   (event_id, serial, unix_ms, utc_offset_min, clock_source, undated_reason, epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (id, ds, _, _, captured) in &rows {
+                let r = clock.resolve(*ds, *captured);
+                insert.execute(params![
+                    id,
+                    serial,
+                    (r.unix * 1000.0).round() as i64,
+                    r.utc_offset_min,
+                    r.source.label(),
+                    r.undated_reason.map(|u| u.code()),
+                    r.epoch as i64,
+                ])?;
+                let slot = sources.iter().position(|s| *s == r.source).unwrap_or(3);
+                counts[slot] += 1;
+                if r.source.is_dated() {
+                    if first.is_none_or(|(f, _)| r.unix < f) {
+                        first = Some((r.unix, r.utc_offset_min));
+                    }
+                    if last.is_none_or(|(l, _)| r.unix > l) {
+                        last = Some((r.unix, r.utc_offset_min));
+                    }
+                    if let Some(offset) = r.utc_offset_min {
+                        offsets.insert(offset);
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+
+        Ok(ClockReport {
+            serial: serial.to_string(),
+            events: rows.len(),
+            by_source: sources
+                .iter()
+                .zip(counts)
+                .map(|(s, n)| (s.label(), n))
+                .collect(),
+            first_dated: first,
+            last_dated: last,
+            utc_offsets_min: offsets.into_iter().collect(),
+            epochs: clock.epochs(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -803,7 +957,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let writer = Store::open(&path).unwrap();
         writer.insert_event("S1", &sample_event()).unwrap();
-        // Hold an uncommitted write open — under WAL a reader still gets a
+        // Hold an uncommitted write open - under WAL a reader still gets a
         // consistent snapshot instead of SQLITE_BUSY / a partial read.
         writer.conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
         writer
@@ -1116,5 +1270,109 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    fn insert_raw(store: &Store, ds: i64, tag: u8, body: &str, captured: i64) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO events
+                   (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES ('S1', ?1, ?2, ?3, ?4, NULL, ?5)",
+                params![
+                    tag as i64,
+                    oura_protocol::events::event_name(tag),
+                    ds,
+                    hex_bytes(body),
+                    captured
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn event_time_dates_real_ring5_events_in_local_time() {
+        // The first sync after a Ring 5 factory reset, synced from UTC-05:00.
+        let store = Store::open_in_memory().unwrap();
+        insert_raw(&store, 1_367, 0x43, "00", 1_794_929_612);
+        insert_raw(&store, 1_379, 0x42, "DA72FC6A00000000F6", 1_794_929_612);
+        insert_raw(&store, 7_648, 0x85, "4C75FC6A00000000F601", 1_794_929_998);
+        insert_raw(&store, 10_412, 0x43, "01", 1_794_930_273);
+
+        let reports = store.rebuild_event_times().unwrap();
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.events, 4);
+        assert_eq!(report.by_source[0], ("anchor", 4));
+        assert_eq!(report.utc_offsets_min, vec![-300]);
+        assert_eq!(report.epochs.len(), 1);
+
+        let (utc, local, date, source): (String, String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT utc_time, local_time, local_date, clock_source
+                 FROM events_timed WHERE ring_timestamp = 1367",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(utc, "2026-11-17T15:29:28.800Z");
+        assert_eq!(local, "2026-11-17T10:29:28.800");
+        assert_eq!(date, "2026-11-17");
+        assert_eq!(source, "anchor");
+
+        // A rebuild replaces the mapping instead of appending to it.
+        store.rebuild_event_times().unwrap();
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM event_time", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 4);
+    }
+
+    #[test]
+    fn unanchored_events_stay_undated_without_local_time() {
+        let store = Store::open_in_memory().unwrap();
+        insert_raw(&store, 100_000, 0x43, "00", 1_789_056_420);
+        insert_raw(&store, 700_000, 0x43, "01", 1_789_056_420);
+        let report = &store.rebuild_event_times().unwrap()[0];
+        assert_eq!(report.by_source[3], ("undated", 2));
+        assert!(report.first_dated.is_none());
+        let (local, reason): (Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT local_time, undated_reason FROM events_timed LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(local, None);
+        assert_eq!(reason.as_deref(), Some("missing_anchor"));
+    }
+
+    #[test]
+    fn decoder_v3_migration_adds_utc_offsets_to_old_anchor_rows() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events
+                   (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
+                 VALUES ('S1', 133, 'rtc_beacon', 7648, ?1,
+                         '{\"trailer\":502,\"unix_time\":1794929996}', 1794929998)",
+                params![hex_bytes("4C75FC6A00000000F601")],
+            )
+            .unwrap();
+        Store::set_meta(&store.conn, "decoder_version", "2").unwrap();
+        store.ensure_decoder_version().unwrap();
+        assert_eq!(store.decoder_version().unwrap(), 3);
+        let json: String = store
+            .conn
+            .query_row("SELECT decoded_json FROM events", [], |r| r.get(0))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["utc_offset_min"].as_i64(), Some(-300));
+        assert_eq!(v["flags"].as_u64(), Some(1));
+        assert!(v.get("trailer").is_none());
     }
 }

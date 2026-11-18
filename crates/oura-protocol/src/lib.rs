@@ -1,4 +1,4 @@
-//! `oura-protocol` — the Oura ring BLE wire language and decoders, pure and I/O-free.
+//! `oura-protocol` - the Oura ring BLE wire language and decoders, pure and I/O-free.
 //!
 //! This is the *interpretation (low level)* layer: it defines the packet framing,
 //! request builders, app-auth crypto, and the decoders that turn raw event bodies
@@ -8,3 +8,4 @@ pub mod auth;
 pub mod device;
 pub mod events;
 pub mod protocol;
+pub mod ring_time;

@@ -66,7 +66,7 @@ pub fn decode_event_body(tag: u8, body: &[u8]) -> Option<serde_json::Value> {
 /// the protobuf field shapes; each is covered by a test using captured bytes.
 fn decode_body(tag: u8, body: &[u8]) -> Option<serde_json::Value> {
     match tag {
-        // ring_start: boot record — reason word then the firmware/bootloader/API
+        // ring_start: boot record - reason word then the firmware/bootloader/API
         // version triplets (same values `DeviceInfo` reports).
         0x41 => decode_ring_start(body),
         // time_sync: u32 LE unix timestamp (plus trailing timezone bytes).
@@ -180,7 +180,7 @@ fn decode_ascii(body: &[u8]) -> Option<serde_json::Value> {
 /// Layout recovered by correlating a captured body against the `DeviceInfo`
 /// response read from the *same* ring over `0x08`: bytes 5..14 are byte-for-byte
 /// the firmware, bootloader and API version triplets that command reports, in
-/// that order. The leading `u32` and the byte at offset 4 are not identified —
+/// that order. The leading `u32` and the byte at offset 4 are not identified -
 /// only one sample has been observed, so they are surfaced verbatim rather than
 /// guessed at.
 ///
@@ -204,27 +204,37 @@ fn decode_ring_start(body: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// `time_sync` (tag 0x42): the ring's echo of a host time sync, u64 LE unix seconds
+/// then the host's UTC offset in signed half hours (or u32 unix + `phone` for a
+/// synthetic phone anchor). See `ring_time::parse_anchor`.
 fn decode_time_sync(body: &[u8]) -> Option<serde_json::Value> {
     if body.len() < 4 {
         return None;
     }
     let unix = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
     if body.get(4..) == Some(b"phone") {
-        Some(serde_json::json!({ "unix_time": unix, "source": "phone" }))
-    } else {
-        Some(serde_json::json!({ "unix_time": unix }))
+        return Some(serde_json::json!({ "unix_time": unix, "source": "phone" }));
     }
+    let mut v = serde_json::json!({ "unix_time": unix });
+    if let Some(offset) = body
+        .get(8)
+        .copied()
+        .and_then(crate::ring_time::utc_offset_minutes)
+    {
+        v["utc_offset_min"] = serde_json::json!(offset);
+    }
+    Some(v)
 }
 
 /// `user_information` (tag `0x5c`): the anthropometric profile the ring keeps for
-/// its on-device metabolic algorithms — one byte per field.
+/// its on-device metabolic algorithms - one byte per field.
 ///
 /// The field meanings are **inferred**, not recovered from a native parser, so the
 /// body is reported with `"_status":"inferred"`. The basis: ecore's
 /// `vo2max_jackson(age, female, weight_kg)` and `bmr_schofield(age, sex, weight_kg)`
 /// (ported in `oura-analysis::ported::metabolic`) take exactly these inputs, and
 /// the sleep-score limits are initialised "from age byte" (`init_limits_v2 @
-/// 0x1f5b20`). On the one captured sample the sex byte is `2` — neither male (0)
+/// 0x1f5b20`). On the one captured sample the sex byte is `2` - neither male (0)
 /// nor female (1), but the value `bmr_schofield` documents as "anything else",
 /// the unset path that averages both sexes. That sample came from a ring that had
 /// just been factory reset, so the values read as firmware defaults (40 y, 75 kg,
@@ -357,16 +367,21 @@ fn decode_cva_raw_ppg(body: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// `rtc_beacon` (tag 0x85): high-precision wall-clock anchor, 1-second granular.
+/// u64 LE unix seconds, the UTC offset in signed half hours (the one the host last
+/// synced), then a flags byte of unknown meaning (`0x01` observed).
 fn decode_rtc_beacon(body: &[u8]) -> Option<serde_json::Value> {
     if body.len() < 10 {
         return None;
     }
     let unix = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-    let trailer = u16::from_le_bytes([body[8], body[9]]);
-    Some(serde_json::json!({
+    let mut v = serde_json::json!({
         "unix_time": unix,
-        "trailer": trailer,
-    }))
+        "flags": body[9],
+    });
+    if let Some(offset) = crate::ring_time::utc_offset_minutes(body[8]) {
+        v["utc_offset_min"] = serde_json::json!(offset);
+    }
+    Some(v)
 }
 
 /// `activity_information`: a state byte followed by per-bin MET levels. The native
@@ -479,7 +494,7 @@ fn decode_spo2_r_pi(body: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// `sleep_acm_period` (tag `0x72`): six accelerometer MAD statistics packed as
-/// fixed-point — three `int + frac/255` values, then three `12-bit/4095 + nibble`
+/// fixed-point - three `int + frac/255` values, then three `12-bit/4095 + nibble`
 /// values, per the native `parse_api_sleep_acm_period`.
 fn decode_sleep_acm_period(body: &[u8]) -> Option<serde_json::Value> {
     if body.len() < 12 {
@@ -659,7 +674,7 @@ fn decode_telemetry(body: &[u8], kind: &str) -> Option<serde_json::Value> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// UNVALIDATED decoders — layouts ported from the native parser (libringeventparser
+// UNVALIDATED decoders - layouts ported from the native parser (libringeventparser
 // .so) but not yet confirmed against captured bytes, because these event types
 // have not appeared in our syncs. Field names/units are inferred from the
 // decompiled arithmetic (often only raw copies, so names are structural). Each
@@ -1329,6 +1344,25 @@ mod tests {
         let v = decode_time_sync(&body).unwrap();
         assert_eq!(v["unix_time"].as_u64().unwrap(), 1_787_733_221);
         assert_eq!(v["source"].as_str(), Some("phone"));
+        assert!(v.get("utc_offset_min").is_none());
+    }
+
+    #[test]
+    fn decodes_ring5_time_sync_and_rtc_beacon_utc_offsets() {
+        // Captured from a Ring 5 (COR_08, firmware 2.2.2) synced from UTC-05:00: the
+        // 0xF6 byte is -10 half hours, not part of a "trailer".
+        let sync = decode_event_body(0x42, &hex::decode("DA72FC6A00000000F6").unwrap()).unwrap();
+        assert_eq!(sync["unix_time"].as_u64(), Some(1_794_929_370));
+        assert_eq!(sync["utc_offset_min"].as_i64(), Some(-300));
+        let beacon =
+            decode_event_body(0x85, &hex::decode("4C75FC6A00000000F601").unwrap()).unwrap();
+        assert_eq!(beacon["unix_time"].as_u64(), Some(1_794_929_996));
+        assert_eq!(beacon["utc_offset_min"].as_i64(), Some(-300));
+        assert_eq!(beacon["flags"].as_u64(), Some(1));
+        assert!(beacon.get("trailer").is_none());
+        // The older zero-offset sync form still reports UTC explicitly.
+        let utc = decode_time_sync(&hex::decode("4fd2376a0000000000").unwrap()).unwrap();
+        assert_eq!(utc["utc_offset_min"].as_i64(), Some(0));
     }
 
     #[test]

@@ -79,7 +79,31 @@ oura --key-file key.hex rdata state
 # Offline: event counts; re-decode stored raw bodies with current decoders
 oura --db oura.db events
 oura --db oura.db redecode
+
+# Offline: date every stored event (wall-clock time + local UTC offset) and show
+# how the history was dated. `sync` does this automatically after each drain.
+oura --db oura.db clock
 ```
+
+### Wall-clock time
+
+Event timestamps are a per-boot decisecond counter. `oura_protocol::ring_time`
+(ported from open_health's `RingClock`) maps them to UTC using the ring's
+`time_sync` and `rtc_beacon` anchors, splitting history at reboots and refusing to
+date intervals where the counter stalled ambiguously or ran faster than real time.
+Each anchor also carries the host's UTC offset (sent with every time sync), so an
+event gets the local offset in effect at its time; daylight-saving changes and
+travel show up from the next sync on. The result lives in the derived
+`event_time` table (rebuilt from the raw events, which are never modified) and the
+`events_timed` view:
+
+```sql
+SELECT local_time, name, decoded_json FROM events_timed
+WHERE clock_source IN ('anchor', 'projected') ORDER BY unix_ms;
+```
+
+`clock_source` is `anchor`/`projected` (trustworthy), `download_time` (sync-time
+arithmetic, off by up to one sync gap) or `undated` (see `undated_reason`).
 
 > After pairing a ring yourself, its measurement features (daytime HR, SpO2…) are
 > **off** - the official app turns them on at onboarding. Run `features --enable-hr
@@ -120,7 +144,7 @@ land. Each decoder has a unit test.
 | `temp_event` / `temp_period` / `sleep_temp` | `i16` LE / 100 | temperature °C (verified worn ~33 °C; 7 probes Ring 3, 3 Ring 5) |
 | `hrv_event` | pairs `(u8 hr, u8 rmssd)`, 5 min apart | avg HR + RMSSD (validated overnight: HR 40, RMSSD ~101 ms) |
 | **`green_ibi_quality_event` (`0x80`)** | `ibi=(b1&7)|(b0<<3)`, `q=(b1>>3)&3` | inter-beat intervals → HR (daytime; ~50 bpm resting) |
-| **`ibi_and_amplitude_event` (`0x60`)** | 14-byte bit-packed | 6× IBI ms + PPG amplitude → HR. Median 41 bpm overnight on Ring 4 (370k beats) but with a fat fast tail (7 % of beats > 100 bpm, p95 139) that a Malik 20 % filter doesn't clean; a Gen 3 Horizon shows the same (13 %). The native parser emits only `timestamp/ibi/amp` per beat (no quality flag), so either the bit layout is partly wrong or the ring ships unfiltered beats — treat `hr_bpm` as raw, and prefer `green_ibi_quality` (`0x80`) when present |
+| **`ibi_and_amplitude_event` (`0x60`)** | 14-byte bit-packed | 6× IBI ms + PPG amplitude → HR. Median 41 bpm overnight on Ring 4 (370k beats) but with a fat fast tail (7 % of beats > 100 bpm, p95 139) that a Malik 20 % filter doesn't clean; a Gen 3 Horizon shows the same (13 %). The native parser emits only `timestamp/ibi/amp` per beat (no quality flag), so either the bit layout is partly wrong or the ring ships unfiltered beats - treat `hr_bpm` as raw, and prefer `green_ibi_quality` (`0x80`) when present |
 | **`spo2_r_pi_event` (`0x8b`)** | header + 3-byte `(R: u16 BE/16384, PI: u8/255×0.05)` | SpO2 R-ratio + perfusion index (validated overnight: R ~0.72, PI ~4%) |
 | `sleep_acm_period` (`0x72`) | 6 fixed-point floats | accelerometer MAD stats during sleep |
 | `sleep_period_information_2` (`0x6a`) | 10-byte `SleepPeriodInfo` (HR ×0.5, breath ÷8, …) | per-window sleep sample from `parse_api_sleep_period_info` |
@@ -129,16 +153,17 @@ land. Each decoder has a unit test.
 | `spo2_event` | header + `u8` per sample | SpO2 % series (decoder ready; not emitted by Ring 5 yet) |
 | `sleep_phase_*` | header byte (page index) + 2-bit codes, 4/byte | hypnogram deep/light/rem/awake. Gen 3 Horizon (fw 3.4.3) emits `sleep_phase_data` (`0x5a`) as numbered 14-byte pages: 52 × 30 s epochs each, ~21 pages a night. Not seen from Ring 4/5 yet |
 | `ambient` / `ehr_acm_intensity` | `u16` LE samples | raw values |
-| `time_sync` / `state_change` / `wear_event` / `alert` / debug | u32 / byte+text | as labelled |
-| `rtc_beacon` (`0x85`) | `u32 unix_s`, reserved bytes, trailer | precise 1-second wall-clock anchor |
+| `time_sync` (`0x42`) | `u64` LE unix_s, then the host's UTC offset as `i8` half hours | wall-clock anchor + `utc_offset_min` |
+| `state_change` / `wear_event` / `alert` / debug | byte+text | as labelled |
+| `rtc_beacon` (`0x85`) | `u64` LE unix_s, UTC offset `i8` half hours, flags byte | precise 1-second wall-clock anchor + `utc_offset_min` |
 | `cva_raw_ppg_data` (`0x81`) | `0x80 + i24 absolute`, otherwise signed i8 deltas | raw CVA PPG samples (stateless per event) |
 | `ring_start` (`0x41`) | `u32` reason, `u8` unknown, then three `a.b.c` version triplets | boot record: firmware / bootloader / API (verified against the same ring's `DeviceInfo`) |
-| `user_information` (`0x5c`) | four `u8`: age, weight kg, sex, height cm | anthropometric profile — field meanings **inferred**, emits `_status: inferred` |
+| `user_information` (`0x5c`) | four `u8`: age, weight kg, sex, height cm | anthropometric profile - field meanings **inferred**, emits `_status: inferred` |
 
 > `ring_start` and `user_information` were **not** recovered from `libringeventparser.so`.
 > `ring_start` was resolved by correlating a captured body against the `DeviceInfo`
 > response of the same ring; `user_information` from the inputs ecore's own metabolic
-> functions take (`vo2max_jackson(age, female, weight_kg)`, `bmr_schofield(age, sex, weight_kg)` —
+> functions take (`vo2max_jackson(age, female, weight_kg)`, `bmr_schofield(age, sex, weight_kg)` -
 > see `oura-analysis::ported::metabolic`) plus the sleep-score limits being initialised
 > "from age byte". Both carry that provenance in their function docs.
 

@@ -35,10 +35,10 @@ crate owns one job and depends only "downward".
 
 | Crate | Layer | Owns | Depends on | I/O? |
 | --- | --- | --- | --- |
-| `oura-protocol` | interpret (decode) | packet framing, request builders, app-auth AES, `device` parsers, `events` decoders + typed sample/event structs | - | none (pure) |
+| `oura-protocol` | interpret (decode) | packet framing, request builders, app-auth AES, `device` parsers, `events` decoders + typed sample/event structs, `ring_time` (ring counter → UTC + local offset) | - | none (pure) |
 | `oura-link` | fetch | `Transport` trait, `btleplug` `BleTransport`, `OuraClient` (firmware/battery/auth/sync/live/features/rdata) | oura-protocol | BLE, async |
 | `oura-analysis` | interpret (compute) | ecore-derived metric algorithms; daily-metric structs; `sleepnet` model wrapper (feature-gated) | oura-protocol | none (pure compute) |
-| `oura-store` | apply | SQLite schema + read/write, sync cursor, `redecode` | oura-protocol | SQLite |
+| `oura-store` | apply | SQLite schema + read/write, sync cursor, `redecode`, derived `event_time` table + `events_timed` view | oura-protocol | SQLite |
 | `oura-cli` | wiring | protocol/debug command dispatch | all of the above | BLE, SQLite |
 
 **Where to add things**

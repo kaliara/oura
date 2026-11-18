@@ -1,4 +1,4 @@
-//! `oura` — a command-line client that reads data directly from an Oura ring over
+//! `oura` - a command-line client that reads data directly from an Oura ring over
 //! BLE, with no Oura cloud account. See `--help` for subcommands.
 
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use oura_link::ble::{self, BleTransport};
 use oura_link::OuraClient;
 use oura_store::storage::Store;
+use oura_store::ClockReport;
 
 /// Read sleep/HR/activity signals straight from an Oura ring (Ring 3/4/5).
 #[derive(Parser, Debug)]
@@ -80,6 +81,10 @@ enum Command {
     },
     /// Show stored event counts from the database (offline).
     Events,
+    /// Recompute every stored event's wall-clock time and local UTC offset from the
+    /// ring's clock anchors, and show how the history was dated (offline). `sync`
+    /// does this automatically; query the result through the `events_timed` view.
+    Clock,
     /// Re-run decoders over already-stored raw event bodies (offline).
     Redecode,
     /// RData bulk raw-sampler control: `state` (read), `stop`/`clear` (teardown),
@@ -91,7 +96,7 @@ enum Command {
         #[arg(default_value = "state")]
         action: String,
     },
-    /// Stream live accelerometer (ACM) — wave your hand to see motion.
+    /// Stream live accelerometer (ACM) - wave your hand to see motion.
     Accel {
         #[arg(long, default_value_t = 15)]
         seconds: u64,
@@ -204,13 +209,13 @@ fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
 }
 
 /// Open the readings store for best-effort live persistence, warning (rather than
-/// failing the command) if it can't be opened — but not pretending it succeeded.
+/// failing the command) if it can't be opened - but not pretending it succeeded.
 fn open_store_or_warn(db: &Path) -> Option<Store> {
     match Store::open(db) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!(
-                "warning: live readings won't be saved — can't open {}: {e}",
+                "warning: live readings won't be saved - can't open {}: {e}",
                 db.display()
             );
             None
@@ -265,6 +270,7 @@ async fn main() -> Result<()> {
         Command::SleepAnalyze { force } => cmd_sleep_analyze(&cli, &key, *force).await,
         Command::Rdata { action } => cmd_rdata(&cli, &key, action).await,
         Command::Events => cmd_events(&cli).await,
+        Command::Clock => cmd_clock(&cli),
         Command::Redecode => {
             let store = Store::open(&cli.db)?;
             let (decoded, total) = store.redecode()?;
@@ -326,7 +332,7 @@ async fn cmd_subscribe(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode: &
 }
 
 /// Set a feature's operating mode (SetFeatureMode). The consumer-feature enable
-/// path — e.g. `feature-mode real_steps` turns on the on-ring step/gait DSP whose
+/// path - e.g. `feature-mode real_steps` turns on the on-ring step/gait DSP whose
 /// `real_steps_features` events (0x7e/0x7f) feed the steps_motion_decoder.
 async fn cmd_feature_mode(
     cli: &Cli,
@@ -634,7 +640,7 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
 
     let inserted = std::cell::Cell::new(0u32);
     // Capture any DB error so a failure surfaces loudly instead of being
-    // swallowed — and so the cursor is never advanced past events we failed to
+    // swallowed - and so the cursor is never advanced past events we failed to
     // store (which would drop them permanently on the next sync).
     let db_err = std::cell::RefCell::new(None);
     // Track whether any batch cursor was actually persisted, so the error message
@@ -700,9 +706,113 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         "Done: {} events received, {} new rows, next cursor {}.",
         outcome.events_synced, inserted, outcome.next_cursor
     );
-
     let _ = client.transport().disconnect().await;
+
+    // The events are safely stored; dating them is derived and can be redone with
+    // `oura clock`, so a failure here is a warning, not a failed sync.
+    match store.rebuild_event_times() {
+        Ok(reports) => {
+            for report in reports.iter().filter(|r| r.serial == serial) {
+                print_clock_summary(report);
+            }
+        }
+        Err(e) => eprintln!("warning: could not date the stored events ({e}); run `oura clock`"),
+    }
     Ok(())
+}
+
+/// Rebuild `event_time` from the stored clock anchors and show the result.
+fn cmd_clock(cli: &Cli) -> Result<()> {
+    let store = Store::open(&cli.db)?;
+    let reports = store.rebuild_event_times()?;
+    if reports.is_empty() {
+        println!("No events stored yet. Run `oura sync --key-file <key>` first.");
+        return Ok(());
+    }
+    for report in &reports {
+        println!("Device {}:", report.serial);
+        print_clock_summary(report);
+        for (i, e) in report.epochs.iter().enumerate() {
+            let zones = if e.utc_offsets_min.is_empty() {
+                "no zone".to_string()
+            } else {
+                e.utc_offsets_min
+                    .iter()
+                    .map(|o| fmt_utc_offset(Some(*o)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "  boot epoch {i}: counter {}..{} ({:.1} h), {} anchors [{}] {zones}, {} reboot records",
+                e.min_ds,
+                e.max_ds,
+                (e.max_ds - e.min_ds) as f64 / 36_000.0,
+                e.anchors,
+                e.anchor_sources.join(", "),
+                e.boots,
+            );
+        }
+    }
+    println!("Query: SELECT local_time, name, decoded_json FROM events_timed ORDER BY unix_ms;");
+    Ok(())
+}
+
+fn print_clock_summary(report: &ClockReport) {
+    let counts = report
+        .by_source
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(source, n)| format!("{n} {source}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (report.first_dated, report.last_dated) {
+        (Some((first, first_zone)), Some((last, last_zone))) => println!(
+            "Clock: {} events ({counts}); dated history {} to {}.",
+            report.events,
+            fmt_wall_time(first, first_zone),
+            fmt_wall_time(last, last_zone),
+        ),
+        _ => println!(
+            "Clock: {} events ({counts}); nothing dated yet (no clock anchor).",
+            report.events
+        ),
+    }
+}
+
+/// `UTC-05:00`-style label; plain `UTC` when the zone is unknown.
+fn fmt_utc_offset(offset_min: Option<i32>) -> String {
+    match offset_min {
+        Some(o) => format!(
+            "UTC{}{:02}:{:02}",
+            if o < 0 { '-' } else { '+' },
+            o.abs() / 60,
+            o.abs() % 60
+        ),
+        None => "UTC".into(),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC±hh:mm` for a UTC unix time shown in `offset_min`.
+fn fmt_wall_time(unix: f64, offset_min: Option<i32>) -> String {
+    let local = unix.floor() as i64 + i64::from(offset_min.unwrap_or(0)) * 60;
+    let (days, secs) = (local.div_euclid(86_400), local.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} {}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60,
+        fmt_utc_offset(offset_min)
+    )
 }
 
 async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
@@ -788,7 +898,7 @@ async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
 
-    println!("Streaming accelerometer for {seconds}s — wave your hand!");
+    println!("Streaming accelerometer for {seconds}s - wave your hand!");
     let mut count = 0u32;
     let mut mags: Vec<f64> = Vec::new();
     client
@@ -809,7 +919,7 @@ async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()
         let max = mags.iter().cloned().fold(0.0, f64::max);
         let moved = (max - min) > 2000.0;
         println!(
-            "{count} samples; |a| range {min:.0}..{max:.0} — {}",
+            "{count} samples; |a| range {min:.0}..{max:.0} - {}",
             if moved {
                 "motion detected ✋"
             } else {
@@ -860,13 +970,13 @@ async fn cmd_rdata(cli: &Cli, key: &Option<[u8; 16]>, action: &str) -> Result<()
 /// RData capacity rate-probe (Phase-2 spike): arm ACM-50, record briefly, then
 /// stop and drain pages to measure the real byte rate and page size. **ALWAYS**
 /// tears down (stop + clear) even on error. Ring should be on the charger and
-/// still — sampling rate is fixed at 50 Hz regardless of motion.
+/// still - sampling rate is fixed at 50 Hz regardless of motion.
 async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     // The ring validates configure timestamps against its own clock, so sync it
-    // to host UTC first — without this, arming returns idle (status 3).
+    // to host UTC first - without this, arming returns idle (status 3).
     client.sync_time().await?;
     let (sub0, st0) = client.rdata_state().await?;
     let batt0 = client.battery().await?;
@@ -896,7 +1006,7 @@ async fn rdata_probe(client: &OuraClient<BleTransport>, secs: u64) -> Result<()>
             batt0.percent as i16 - batt1.percent as i16,
             secs as f64 / 60.0
         );
-        // Drain BEFORE stop — the documented lifecycle is configure -> get_page ->
+        // Drain BEFORE stop - the documented lifecycle is configure -> get_page ->
         // stop -> clear, and stop may discard the buffer.
         println!("Draining pages (before stop)...");
         let mut pages = 0u32;
@@ -983,8 +1093,8 @@ fn rdata_status_name(s: u8) -> &'static str {
     }
 }
 
-/// Test 1: run the app's strict start recipe — Clear (require SUCCESS) -> state ->
-/// CONFIGURE with startTime=0 — and report each status. Tears down afterward.
+/// Test 1: run the app's strict start recipe - Clear (require SUCCESS) -> state ->
+/// CONFIGURE with startTime=0 - and report each status. Tears down afterward.
 async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1011,10 +1121,10 @@ async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
         rdata_status_name(cst)
     );
     if cst == 0 {
-        println!(">>> START ACCEPTED — capability is enabled after all!");
+        println!(">>> START ACCEPTED - capability is enabled after all!");
     } else {
         println!(
-            ">>> still {} — capability gate confirmed.",
+            ">>> still {} - capability gate confirmed.",
             rdata_status_name(cst)
         );
     }
@@ -1093,7 +1203,7 @@ async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
         println!(">>> drained {} pages, {} bytes", captured.0, captured.1);
     } else {
         println!(
-            ">>> still {} — enabling did not unlock CONFIGURE.",
+            ">>> still {} - enabling did not unlock CONFIGURE.",
             rdata_status_name(cst)
         );
     }
@@ -1109,7 +1219,7 @@ async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
 
 /// Try several RData `configure` argument variants and report which (if any)
 /// moves the ring out of the idle state (status 3). Each attempt is immediately
-/// torn down. Pure diagnostic for the Phase-2 spike — no long recording.
+/// torn down. Pure diagnostic for the Phase-2 spike - no long recording.
 async fn rdata_sweep(client: &OuraClient<BleTransport>) -> Result<()> {
     use oura_protocol::protocol::rdata::DataType;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1159,7 +1269,7 @@ async fn rdata_sweep(client: &OuraClient<BleTransport>) -> Result<()> {
         let _ = client.rdata_clear().await;
     }
     println!("\nIf every variant stayed idle, RDataStart needs a precondition we");
-    println!("haven't replicated — next step is decompiling the app's start path.");
+    println!("haven't replicated - next step is decompiling the app's start path.");
     Ok(())
 }
 
@@ -1183,6 +1293,20 @@ async fn cmd_events(cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_wall_time_in_the_events_zone() {
+        assert_eq!(
+            fmt_wall_time(1_794_929_368.8, Some(-300)),
+            "2026-11-17 10:29:28 UTC-05:00"
+        );
+        assert_eq!(fmt_wall_time(0.0, None), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            fmt_wall_time(1_709_164_800.0, Some(330)), // 2024-02-29 00:00 UTC
+            "2024-02-29 05:30:00 UTC+05:30"
+        );
+        assert_eq!(fmt_utc_offset(Some(-570)), "UTC-09:30");
+    }
 
     #[test]
     fn generate_key_uses_os_csprng() {
