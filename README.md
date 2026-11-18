@@ -76,13 +76,16 @@ State-changing and destructive commands are hidden behind `--include-state` and
   BLE constants, the auth operations, key generation, and nonce encryption.
 - [`docs/data-recovery-map.md`](docs/data-recovery-map.md): what the ring emits vs
   what only the cloud computes.
+- [`docs/cloud-api-coverage.md`](docs/cloud-api-coverage.md): every Oura Cloud API
+  v2 field mapped to its ring source (raw, derivable, feature-gated, or not ring
+  data), plus the features a reset ring starts with off.
 - [`docs/sync-orchestration.md`](docs/sync-orchestration.md): when and how the app
   pulls each data channel, and the minimal client sync recipe.
 - [`docs/ring-5-observations.md`](docs/ring-5-observations.md): Ring 5 BLE surface
   and first-contact findings.
 - [`docs/ring-features.md`](docs/ring-features.md): the feature capabilities, runtime
   modes, what's on by default, and which event each enabled feature produces (incl.
-  what `experimental` does — and doesn't).
+  what `experimental` does - and doesn't).
 - [`docs/cva-cardiovascular-age.md`](docs/cva-cardiovascular-age.md): decoding the raw
   PPG (`cva_raw_ppg_data` 0x81) and running the cardiovascular-age model.
 - [`docs/spo2-calibration.md`](docs/spo2-calibration.md): turning the SpO2 R-ratio into
@@ -91,15 +94,15 @@ State-changing and destructive commands are hidden behind `--include-state` and
   working cloud download pipeline + codename map, per-device encryption status, and
   why the firmware key is unreachable (device-resident; not brute-forceable).
 - [`docs/security-observations.md`](docs/security-observations.md): findings-only
-  notes on the model/firmware encryption (the "what", not the "how" — no keys,
+  notes on the model/firmware encryption (the "what", not the "how" - no keys,
   endpoints, or procedures).
 - [`docs/architecture.md`](docs/architecture.md): the fetch/interpret/apply crate
   layering and where to add things.
 - [`docs/algorithms/README.md`](docs/algorithms/README.md): the on-device ecore
   metric algorithms (scores, sleep, baselines) and their porting status.
 - [`docs/factory-reset.md`](docs/factory-reset.md): the two verified ways to reset a
-  ring — the `1a00` command and a button-free hardware procedure on the Gen3/Ring 4
-  dock — plus what a reset erases and how to re-pair without handing the ring back
+  ring - the `1a00` command and a button-free hardware procedure on the Gen3/Ring 4
+  dock - plus what a reset erases and how to re-pair without handing the ring back
   to the Oura app.
 - [`docs/native-decoder.md`](docs/native-decoder.md): porting event-body decoders
   from the native `libringeventparser.so` (how the byte layouts were recovered with
